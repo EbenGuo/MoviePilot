@@ -146,227 +146,6 @@ class U115Pan(StorageBase, metaclass=Singleton):
             raise Exception(result.get("message"))
         return result.get("data")
 
-    def check_login(self) -> Optional[Dict]:
-        """
-        改进的带PKCE校验的登录状态检查
-        """
-        if not self._auth_state:
-            return {"status": -1, "tip": "生成二维码失败"}
-        try:
-            resp = self.session.post(
-                "https://passportapi.115.com/open/checkDeviceCode",
-                data={
-                    "uid": self._auth_state["uid"],
-                    "time": self._auth_state["time"],
-                    "sign": self._auth_state["sign"]
-                }
-            )
-            if resp is None:
-                return {"status": -1, "tip": "网络错误"}
-            result = resp.json()
-            if result.get("code") != 0 or not result.get("data"):
-                return {"status": -1, "tip": result.get("message")}
-            if result["data"]["status"] == 2:
-                tokens = self.__get_access_token()
-                self.set_config({
-                    "refresh_time": int(time.time()),
-                    **tokens
-                })
-            return {"status": result["data"]["status"], "tip": result["data"]["msg"]}
-        except requests.exceptions.RequestException as e:
-            return {"status": -1, "tip": str(e)}
-
-    def init_storage(self):
-        """
-        初始化存储连接
-        """
-        self.session.headers.update({
-            "Authorization": f"Bearer {self.access_token}"
-        })
-
-    def list(self, fileitem: schemas.FileItem) -> List[schemas.FileItem]:
-        """
-        目录遍历实现
-        """
-        cid = self._path_to_id(fileitem.path)
-        items = []
-        offset = 0
-
-        while True:
-            resp = self._request_api(
-                "GET",
-                "/open/ufile/files",
-                "data",
-                params={"cid": cid, "limit": 1000, "offset": offset}
-            )
-            if not resp:
-                break
-            for item in resp:
-                path = self._id_to_path(item.get("fid"))
-                items.append(schemas.FileItem(
-                    fileid=item["fid"],
-                ))
-                # 更新缓存
-                self._id_cache[path] = item["cid"]
-
-            if len(resp) < 1000:
-                break
-            offset += len(resp)
-
-        return items
-
-    def create_folder(self, parent_item: schemas.FileItem, name: str) -> schemas.FileItem:
-        """
-        创建目录
-        """
-        parent_id = self._path_to_id(parent_item.path)
-        resp = self._request_api(
-            "POST",
-            "/open/folder/add",
-            "data",
-            data={
-                "pid": parent_id,
-                "name": name
-            }
-        )
-        new_path = Path(parent_item.path) / name
-        # 缓存新目录
-        self._id_cache[str(new_path)] = resp["file_id"]
-        return schemas.FileItem(
-            fileid=resp["file_id"],
-            path=str(new_path),
-            name=name,
-            type="dir",
-            modify_time=int(time.time())
-        )
-
-    def upload(self, target_dir: schemas.FileItem, local_path: Path, new_name: str = None) -> schemas.FileItem:
-        """
-        实现带秒传、断点续传和二次认证的文件上传
-        """
-        # 计算文件特征值
-        target_name = new_name or local_path.name
-        file_size = local_path.stat().st_size
-        file_sha1 = self._calc_sha1(local_path)
-
-        # 获取目标目录CID
-        target_cid = self._path_to_id(target_dir.path)
-        target_param = f"U_1_{target_cid}"
-
-        # Step 1: 初始化上传
-        init_data = {
-            "file_name": target_name,
-            "file_size": file_size,
-            "target": target_param,
-            "fileid": file_sha1
-        }
-        init_resp = self._request_api(
-            "POST",
-            "/open/upload/init",
-            "data",
-            data=init_data
-        )
-
-        # 处理秒传成功
-        if init_resp.get("status") == 2:
-            return schemas.FileItem(
-                fileid=init_resp["file_id"],
-                path=str(Path(target_dir.path) / target_name),
-                name=target_name,
-                type="file",
-                modify_time=int(time.time())
-            )
-
-        # Step 2: 处理二次认证
-        if init_resp.get("code") in [700, 701]:
-            sign_check = init_resp["sign_check"].split("-")
-            start = int(sign_check[0])
-            end = int(sign_check[1])
-
-            # 计算指定区间的SHA1
-            with open(local_path, "rb") as f:
-                f.seek(start)
-                chunk = f.read(end - start + 1)
-                sign_val = hashlib.sha1(chunk).hexdigest().upper()
-
-            # 重新初始化请求
-            init_data.update({
-                "sign_key": init_resp["sign_key"],
-                "sign_val": sign_val
-            })
-            init_resp = self._request_api(
-                "POST",
-                "/open/upload/init",
-                "data",
-                data=init_data
-            )
-
-        # Step 3: 获取上传凭证
-        token_resp = self._request_api(
-            "GET",
-            "/open/upload/get_token",
-            "data"
-        )
-
-        # Step 4: 对象存储上传
-        upload_url = f"https://{token_resp['endpoint']}"
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "x-oss-security-token": token_resp["SecurityToken"],
-            "Content-Type": "application/octet-stream"
-        }
-
-        # 断点续传处理
-        uploaded = 0
-        while uploaded < file_size:
-            # 10MB分块
-            chunk_size = min(1024 * 1024 * 10, file_size - uploaded)
-
-            # 实际上传
-            with open(local_path, "rb") as f:
-                f.seek(uploaded)
-                chunk = f.read(chunk_size)
-                requests.put(
-                    upload_url,
-                    headers=headers,
-                    data=chunk
-                ).raise_for_status()
-
-            uploaded += chunk_size
-
-        # 构造返回结果
-        return schemas.FileItem(
-            fileid=init_resp.get("file_id") or self._path_to_id(str(Path(target_dir.path) / target_name)),
-            type="file",
-            path=str(Path(target_dir.path) / target_name),
-            name=target_name,
-            basename=Path(target_name).stem,
-            extension=Path(target_name).suffix[1:],
-            modify_time=int(time.time())
-        )
-
-    def download(self, fileitem: schemas.FileItem, save_path: Path = None) -> Path:
-        """
-        带限速处理的下载
-        """
-        detail = self.get_item(Path(fileitem.path))
-        local_path = save_path or settings.TEMP_PATH / fileitem.name
-        download_info = self._request_api(
-            "POST",
-            "/open/ufile/downurl",
-            "data",
-            data={
-                "pick_code": detail.pickcode
-            }
-        )
-        download_url = download_info["url"]
-        with self.session.get(download_url, stream=True) as r:
-            r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        return local_path
-
     def _request_api(self, method: str, endpoint: str,
                      result_key: str = None, **kwargs) -> Optional[Union[dict, list]]:
         """
@@ -471,6 +250,245 @@ class U115Pan(StorageBase, metaclass=Singleton):
                 sha1.update(chunk)
         return sha1.hexdigest()
 
+    def check_login(self) -> Optional[Dict]:
+        """
+        改进的带PKCE校验的登录状态检查
+        """
+        if not self._auth_state:
+            return {"status": -1, "tip": "生成二维码失败"}
+        try:
+            resp = self.session.post(
+                "https://passportapi.115.com/open/checkDeviceCode",
+                data={
+                    "uid": self._auth_state["uid"],
+                    "time": self._auth_state["time"],
+                    "sign": self._auth_state["sign"]
+                }
+            )
+            if resp is None:
+                return {"status": -1, "tip": "网络错误"}
+            result = resp.json()
+            if result.get("code") != 0 or not result.get("data"):
+                return {"status": -1, "tip": result.get("message")}
+            if result["data"]["status"] == 2:
+                tokens = self.__get_access_token()
+                self.set_config({
+                    "refresh_time": int(time.time()),
+                    **tokens
+                })
+            return {"status": result["data"]["status"], "tip": result["data"]["msg"]}
+        except requests.exceptions.RequestException as e:
+            return {"status": -1, "tip": str(e)}
+
+    def init_storage(self):
+        """
+        初始化存储连接
+        """
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.access_token}"
+        })
+
+    def list(self, fileitem: schemas.FileItem) -> List[schemas.FileItem]:
+        """
+        目录遍历实现
+        """
+
+        if fileitem.type == "file":
+            return [self.detail(fileitem)]
+
+        cid = self._path_to_id(fileitem.path)
+        items = []
+        offset = 0
+
+        while True:
+            resp = self._request_api(
+                "GET",
+                "/open/ufile/files",
+                "data",
+                params={"cid": cid, "limit": 1000, "offset": offset}
+            )
+            if not resp:
+                break
+            for item in resp:
+                path = f"{fileitem.path}/{item['fn']}" + ("/" if item["fc"] == "0" else "")
+                items.append(schemas.FileItem(
+                    fileid=item["fid"],
+                    name=item["fn"],
+                    basename=Path(item["fn"]).stem,
+                    extension=item["ico"],
+                    type="dir" if item["fc"] == "0" else "file",
+                    path=path,
+                    size=item["fs"] if item["fc"] == "1" else None,
+                    modify_time=item["upt"],
+                    pickcode=item["pc"],
+                    thumbnail=item["thumb"],
+                ))
+                # 更新缓存
+                self._id_cache[path] = item["cid"]
+
+            if len(resp) < 1000:
+                break
+            offset += len(resp)
+
+        return items
+
+    def create_folder(self, parent_item: schemas.FileItem, name: str) -> schemas.FileItem:
+        """
+        创建目录
+        """
+        parent_id = self._path_to_id(parent_item.path)
+        resp = self._request_api(
+            "POST",
+            "/open/folder/add",
+            "data",
+            data={
+                "pid": parent_id,
+                "name": name
+            }
+        )
+        new_path = Path(parent_item.path) / name
+        # 缓存新目录
+        self._id_cache[str(new_path)] = resp["file_id"]
+        return schemas.FileItem(
+            fileid=resp["file_id"],
+            path=str(new_path) + "/",
+            name=name,
+            basename=name,
+            type="dir",
+            modify_time=int(time.time())
+        )
+
+    def upload(self, target_dir: schemas.FileItem, local_path: Path, new_name: str = None) -> schemas.FileItem:
+        """
+        实现带秒传、断点续传和二次认证的文件上传
+        """
+        # 计算文件特征值
+        target_name = new_name or local_path.name
+        file_size = local_path.stat().st_size
+        file_sha1 = self._calc_sha1(local_path)
+
+        # 获取目标目录CID
+        target_cid = self._path_to_id(target_dir.path)
+        target_param = f"U_1_{target_cid}"
+
+        # Step 1: 初始化上传
+        init_data = {
+            "file_name": target_name,
+            "file_size": file_size,
+            "target": target_param,
+            "fileid": file_sha1
+        }
+        init_resp = self._request_api(
+            "POST",
+            "/open/upload/init",
+            "data",
+            data=init_data
+        )
+
+        # 处理秒传成功
+        if init_resp.get("status") == 2:
+            return schemas.FileItem(
+                fileid=init_resp["file_id"],
+                path=str(Path(target_dir.path) / target_name),
+                name=target_name,
+                basename=Path(target_dir.name).stem,
+                extension=Path(target_dir.name).suffix[1:],
+                size=file_size,
+                type="file",
+                modify_time=int(time.time())
+            )
+
+        # Step 2: 处理二次认证
+        if init_resp.get("code") in [700, 701]:
+            sign_check = init_resp["sign_check"].split("-")
+            start = int(sign_check[0])
+            end = int(sign_check[1])
+
+            # 计算指定区间的SHA1
+            with open(local_path, "rb") as f:
+                f.seek(start)
+                chunk = f.read(end - start + 1)
+                sign_val = hashlib.sha1(chunk).hexdigest().upper()
+
+            # 重新初始化请求
+            init_data.update({
+                "sign_key": init_resp["sign_key"],
+                "sign_val": sign_val
+            })
+            init_resp = self._request_api(
+                "POST",
+                "/open/upload/init",
+                "data",
+                data=init_data
+            )
+
+        # Step 3: 获取上传凭证
+        token_resp = self._request_api(
+            "GET",
+            "/open/upload/get_token",
+            "data"
+        )
+
+        # Step 4: 对象存储上传
+        upload_url = f"https://{token_resp['endpoint']}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "x-oss-security-token": token_resp["SecurityToken"],
+            "Content-Type": "application/octet-stream"
+        }
+
+        # 断点续传处理
+        uploaded = 0
+        while uploaded < file_size:
+            # 10MB分块
+            chunk_size = min(1024 * 1024 * 10, file_size - uploaded)
+
+            # 实际上传
+            with open(local_path, "rb") as f:
+                f.seek(uploaded)
+                chunk = f.read(chunk_size)
+                requests.put(
+                    upload_url,
+                    headers=headers,
+                    data=chunk
+                ).raise_for_status()
+
+            uploaded += chunk_size
+
+        # 构造返回结果
+        return schemas.FileItem(
+            fileid=init_resp.get("file_id") or self._path_to_id(str(Path(target_dir.path) / target_name)),
+            type="file",
+            path=str(Path(target_dir.path) / target_name),
+            name=target_name,
+            basename=Path(target_name).stem,
+            extension=Path(target_name).suffix[1:],
+            size=file_size,
+            modify_time=int(time.time())
+        )
+
+    def download(self, fileitem: schemas.FileItem, save_path: Path = None) -> Path:
+        """
+        带限速处理的下载
+        """
+        detail = self.get_item(Path(fileitem.path))
+        local_path = save_path or settings.TEMP_PATH / fileitem.name
+        download_info = self._request_api(
+            "POST",
+            "/open/ufile/downurl",
+            "data",
+            data={
+                "pick_code": detail.pickcode
+            }
+        )
+        download_url = download_info["url"]
+        with self.session.get(download_url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return local_path
+
     def check(self) -> bool:
         return self.access_token is not None
 
@@ -506,6 +524,9 @@ class U115Pan(StorageBase, metaclass=Singleton):
         if resp["state"]:
             if fileitem.path in self._id_cache:
                 del self._id_cache[fileitem.path]
+                for key in list(self._id_cache.keys()):
+                    if key.startswith(fileitem.path):
+                        del self._id_cache[key]
             new_path = Path(fileitem.path).parent / name
             self._id_cache[str(new_path)] = file_id
             return True
@@ -528,8 +549,8 @@ class U115Pan(StorageBase, metaclass=Singleton):
                 }
             )
             return schemas.FileItem(
-                path=str(path),
                 fileid=resp["file_id"],
+                path=str(path) + ("/" if resp["file_category"] == "1" else ""),
                 type="file" if resp["file_category"] == "1" else "dir",
                 name=resp["file_name"],
                 basename=Path(resp["file_name"]).stem,
@@ -546,10 +567,35 @@ class U115Pan(StorageBase, metaclass=Singleton):
         """
         获取指定路径的文件夹，如不存在则创建
         """
-        try:
-            return self.get_item(path)
-        except FileNotFoundError:
-            return self.create_folder(self.get_item(path.parent), path.name)
+
+        def __find_dir(_fileitem: schemas.FileItem, _name: str) -> Optional[schemas.FileItem]:
+            """
+            查找下级目录中匹配名称的目录
+            """
+            for sub_folder in self.list(_fileitem):
+                if sub_folder.type != "dir":
+                    continue
+                if sub_folder.name == _name:
+                    return sub_folder
+            return None
+
+        # 是否已存在
+        folder = self.get_item(path)
+        if folder:
+            return folder
+        # 逐级查找和创建目录
+        fileitem = schemas.FileItem(path="/")
+        for part in path.parts[1:]:
+            dir_file = __find_dir(fileitem, part)
+            if dir_file:
+                fileitem = dir_file
+            else:
+                dir_file = self.create_folder(fileitem, part)
+                if not dir_file:
+                    logger.warn(f"115 创建目录 {fileitem.path}{part} 失败！")
+                    return None
+                fileitem = dir_file
+        return fileitem
 
     def detail(self, fileitem: schemas.FileItem) -> Optional[schemas.FileItem]:
         """
