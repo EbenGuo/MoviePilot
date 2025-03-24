@@ -1,34 +1,44 @@
-name: Upstream Sync
+name: Upstream Repository Sync
 
+# 更精确的权限控制
 permissions:
-    contents: write
+  contents: write  # 需要写入权限来推送变更
+  pull-requests: write  # 如果需要自动创建 PR 可保留
 
 on:
-    schedule:
-        - cron: "0 * * * *"
-    workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"  # 调整为每天 UTC 时间 0 点执行
+  workflow_dispatch:     # 保留手动触发功能
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  upstream-sync:
+    name: Synchronize with Upstream
+    runs-on: ubuntu-latest
+    # 更精确的条件判断
+    if: github.event.repository.fork == true
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v3
+    steps:
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4      # 升级到最新版本
+        with:
+          fetch-depth: 0              # 获取完整提交历史
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: jxxghp/MoviePilot
-                  upstream_sync_branch: v2
-                  target_sync_branch: v2
-                  test_mode: false
+      - name: Synchronize with Upstream
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          upstream_sync_repo: jxxghp/MoviePilot
+          upstream_sync_branch: v2
+          target_sync_branch: v2
+          # 添加冲突处理策略
+          conflict_resolution: "hard-reset"  # 或根据需求选择其他策略
+          dry_run: false
 
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork."
-                  exit 1
+      - name: Post-Sync Cleanup
+        if: always()  # 无论成功失败都执行
+        run: |
+          echo "Sync operation completed at $(date)"
+
+    # 错误处理移至 job 级别
+    timeout-minutes: 15  # 添加超时设置
