@@ -7,7 +7,7 @@ permissions:
 
 on:
   schedule:
-    - cron: "0 0 * * *"  # 调整为每天 UTC 时间 0 点执行
+    - cron: "0 * * * *"  # 调整为每天 UTC 时间 0 点执行
   workflow_dispatch:     # 保留手动触发功能
 
 jobs:
