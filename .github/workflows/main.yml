@@ -1,27 +1,25 @@
 name: Upstream Repository Sync
 
-# 更精确的权限控制
 permissions:
-  contents: write  # 需要写入权限来推送变更
-  pull-requests: write  # 如果需要自动创建 PR 可保留
+  contents: write
 
 on:
   schedule:
-    - cron: "0 * * * *"  # 调整为每天 UTC 时间 0 点执行
-  workflow_dispatch:     # 保留手动触发功能
+    - cron: "0 0 * * *"  # 每日 UTC 0 点执行
+  workflow_dispatch:
 
 jobs:
   upstream-sync:
     name: Synchronize with Upstream
     runs-on: ubuntu-latest
-    # 更精确的条件判断
     if: github.event.repository.fork == true
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Target Repository
-        uses: actions/checkout@v4      # 升级到最新版本
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0              # 获取完整提交历史
+          fetch-depth: 0  # 获取完整提交历史
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Synchronize with Upstream
@@ -31,14 +29,16 @@ jobs:
           upstream_sync_repo: jxxghp/MoviePilot
           upstream_sync_branch: v2
           target_sync_branch: v2
-          # 添加冲突处理策略
-          conflict_resolution: "hard-reset"  # 或根据需求选择其他策略
-          dry_run: false
+          # 根据官方文档保留有效参数
+          git_config_user: "GitHub Actions"
+          git_config_email: "actions@github.com"
+          git_config_pull_rebase: "false"
 
-      - name: Post-Sync Cleanup
-        if: always()  # 无论成功失败都执行
+      - name: Error Handler
+        if: failure()
         run: |
-          echo "Sync operation completed at $(date)"
-
-    # 错误处理移至 job 级别
-    timeout-minutes: 15  # 添加超时设置
+          echo "::error::Sync failed! Please check conflicts or manually sync."
+          echo "建议解决方案："
+          echo "1. 检查上游仓库变更是否导致冲突"
+          echo "2. 手动执行 git pull https://github.com/jxxghp/MoviePilot v2"
+          echo "3. 解决冲突后强制推送: git push --force"
